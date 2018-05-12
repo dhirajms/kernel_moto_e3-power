@@ -324,9 +324,8 @@ replay:
 		if (nlh->nlmsg_len < NLMSG_HDRLEN ||
 		    skb->len < nlh->nlmsg_len ||
 		    nlmsg_len(nlh) < sizeof(struct nfgenmsg)) {
-			nfnl_err_reset(&err_list);
-			success = false;
-			goto done;
+			err = -EINVAL;
+			goto ack;
 		}
 
 		/* Only requests are handled by the kernel */

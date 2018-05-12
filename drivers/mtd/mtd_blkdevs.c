@@ -97,13 +97,14 @@ static int do_blktrans_request(struct mtd_blktrans_ops *tr,
 	if (req->cmd_flags & REQ_DISCARD)
 		return tr->discard(dev, block, nsect);
 
-	if (rq_data_dir(req) == READ) {
+	switch(rq_data_dir(req)) {
+	case READ:
 		for (; nsect > 0; nsect--, block++, buf += tr->blksize)
 			if (tr->readsect(dev, block, buf))
 				return -EIO;
 		rq_flush_dcache_pages(req);
 		return 0;
-	} else {
+	case WRITE:
 		if (!tr->writesect)
 			return -EIO;
 
@@ -112,6 +113,9 @@ static int do_blktrans_request(struct mtd_blktrans_ops *tr,
 			if (tr->writesect(dev, block, buf))
 				return -EIO;
 		return 0;
+	default:
+		printk(KERN_NOTICE "Unknown request %u\n", rq_data_dir(req));
+		return -EIO;
 	}
 }
 
@@ -402,12 +406,14 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 		snprintf(gd->disk_name, sizeof(gd->disk_name),
 			 "%s%d", tr->name, new->devnum);
 
-	set_capacity(gd, (new->size * tr->blksize) >> 9);
+	set_capacity(gd, ((u64)new->size * tr->blksize) >> 9);
 
 	/* Create the request queue */
 	spin_lock_init(&new->queue_lock);
 	new->rq = blk_init_queue(mtd_blktrans_request, &new->queue_lock);
-
+#ifdef CONFIG_MTK_MTD_NAND
+	new->rq->backing_dev_info.ra_pages = 0;
+#endif
 	if (!new->rq)
 		goto error3;
 

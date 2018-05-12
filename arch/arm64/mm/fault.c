@@ -30,14 +30,13 @@
 #include <linux/highmem.h>
 #include <linux/perf_event.h>
 
-#include <asm/cpufeature.h>
 #include <asm/exception.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
-#include <asm/sysreg.h>
 #include <asm/system_misc.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include <mt-plat/mtk_hooks.h>
 
 static const char *fault_name(unsigned int esr);
 
@@ -81,11 +80,6 @@ void show_pte(struct mm_struct *mm, unsigned long addr)
 	printk("\n");
 }
 
-static bool is_el1_instruction_abort(unsigned int esr)
-{
-	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_CUR;
-}
-
 /*
  * The kernel tried to access some page that wasn't present.
  */
@@ -94,9 +88,8 @@ static void __do_kernel_fault(struct mm_struct *mm, unsigned long addr,
 {
 	/*
 	 * Are we prepared to handle this kernel fault?
-	 * We are almost certainly not prepared to handle instruction faults.
 	 */
-	if (!is_el1_instruction_abort(esr) && fixup_exception(regs))
+	if (fixup_exception(regs))
 		return;
 
 	/*
@@ -122,6 +115,10 @@ static void __do_user_fault(struct task_struct *tsk, unsigned long addr,
 			    struct pt_regs *regs)
 {
 	struct siginfo si;
+
+	if (mem_fault_debug_hook)
+		if (!mem_fault_debug_hook(regs))
+			return;
 
 	if (show_unhandled_signals && unhandled_signal(tsk, sig) &&
 	    printk_ratelimit()) {
@@ -158,6 +155,8 @@ static void do_bad_area(unsigned long addr, unsigned int esr, struct pt_regs *re
 
 #define VM_FAULT_BADMAP		0x010000
 #define VM_FAULT_BADACCESS	0x020000
+
+#define ESR_LNX_EXEC		(1 << 24)
 
 static int __do_page_fault(struct mm_struct *mm, unsigned long addr,
 			   unsigned int mm_flags, unsigned long vm_flags,
@@ -197,26 +196,6 @@ out:
 	return fault;
 }
 
-static inline bool is_permission_fault(unsigned int esr, struct pt_regs *regs)
-{
-	unsigned int ec       = ESR_ELx_EC(esr);
-	unsigned int fsc_type = esr & ESR_ELx_FSC_TYPE;
-
-	if (ec != ESR_ELx_EC_DABT_CUR && ec != ESR_ELx_EC_IABT_CUR)
-		return false;
-
-	if (system_uses_ttbr0_pan())
-		return fsc_type == ESR_ELx_FSC_FAULT &&
-			(regs->pstate & PSR_PAN_BIT);
-	else
-		return fsc_type == ESR_ELx_FSC_PERM;
-}
-
-static bool is_el0_instruction_abort(unsigned int esr)
-{
-	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW;
-}
-
 static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 				   struct pt_regs *regs)
 {
@@ -243,23 +222,11 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 	if (user_mode(regs))
 		mm_flags |= FAULT_FLAG_USER;
 
-	if (is_el0_instruction_abort(esr)) {
+	if (esr & ESR_LNX_EXEC) {
 		vm_flags = VM_EXEC;
-	} else if ((esr & ESR_ELx_WNR) && !(esr & ESR_ELx_CM)) {
+	} else if ((esr & ESR_EL1_WRITE) && !(esr & ESR_EL1_CM)) {
 		vm_flags = VM_WRITE;
 		mm_flags |= FAULT_FLAG_WRITE;
-	}
-
-	if (addr < USER_DS && is_permission_fault(esr, regs)) {
-		/* regs->orig_addr_limit may be 0 if we entered from EL0 */
-		if (regs->orig_addr_limit == KERNEL_DS)
-			die("Accessing user space memory with fs=KERNEL_DS", regs, esr);
-
-		if (is_el1_instruction_abort(esr))
-			die("Attempting to execute userspace memory", regs, esr);
-
-		if (!search_exception_tables(regs->pc))
-			panic("Accessing user space memory outside uaccess.h routines");
 	}
 
 	/*
@@ -291,11 +258,8 @@ retry:
 	 * signal first. We do not need to release the mmap_sem because it
 	 * would already be released in __lock_page_or_retry in mm/filemap.c.
 	 */
-	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current)) {
-		if (!user_mode(regs))
-			goto no_context;
+	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current))
 		return 0;
-	}
 
 	/*
 	 * Major/minor page fault accounting is only done on the initial
@@ -412,7 +376,7 @@ static int do_bad(unsigned long addr, unsigned int esr, struct pt_regs *regs)
 	return 1;
 }
 
-static const struct fault_info {
+static struct fault_info {
 	int	(*fn)(unsigned long addr, unsigned int esr, struct pt_regs *regs);
 	int	sig;
 	int	code;
@@ -498,6 +462,8 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
 {
 	const struct fault_info *inf = fault_info + (esr & 63);
 	struct siginfo info;
+	unsigned long sctlr = 0;
+	struct mm_struct *mm = NULL;
 
 	if (!inf->fn(addr, esr, regs))
 		return;
@@ -505,6 +471,18 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
 	pr_alert("Unhandled fault: %s (0x%08x) at 0x%016lx\n",
 		 inf->name, esr, addr);
 
+	asm volatile(
+		"MRS %0, sctlr_el1\n\t"
+		: "=r"(sctlr)
+		:
+		:
+		);
+	pr_alert("SCTLR : %lx\n", sctlr);
+
+	if (addr < TASK_SIZE)
+		mm = current->mm;
+
+	show_pte(mm, addr);
 	info.si_signo = inf->sig;
 	info.si_errno = 0;
 	info.si_code  = inf->code;
@@ -551,6 +529,21 @@ void __init hook_debug_fault_code(int nr,
 	debug_fault_info[nr].name	= name;
 }
 
+#ifdef CONFIG_MEDIATEK_SOLUTION
+void __init hook_fault_code(int nr,
+		int (*fn)(unsigned long, unsigned int, struct pt_regs *),
+		int sig, int code, const char *name)
+{
+	BUG_ON(nr < 0 || nr >= ARRAY_SIZE(fault_info));
+
+	fault_info[nr].fn   = fn;
+	fault_info[nr].sig  = sig;
+	fault_info[nr].code = code;
+	fault_info[nr].name = name;
+}
+#endif
+
+
 asmlinkage int __exception do_debug_exception(unsigned long addr,
 					      unsigned int esr,
 					      struct pt_regs *regs)
@@ -572,23 +565,3 @@ asmlinkage int __exception do_debug_exception(unsigned long addr,
 
 	return 0;
 }
-
-#ifdef CONFIG_ARM64_PAN
-void cpu_enable_pan(void *__unused)
-{
-	config_sctlr_el1(SCTLR_EL1_SPAN, 0);
-}
-#endif /* CONFIG_ARM64_PAN */
-
-#ifdef CONFIG_ARM64_UAO
-/*
- * Kernel threads have fs=KERNEL_DS by default, and don't need to call
- * set_fs(), devtmpfs in particular relies on this behaviour.
- * We need to enable the feature at runtime (instead of adding it to
- * PSR_MODE_EL1h) as the feature may not be implemented by the cpu.
- */
-void cpu_enable_uao(void *__unused)
-{
-	asm(SET_PSTATE_UAO(1));
-}
-#endif /* CONFIG_ARM64_UAO */

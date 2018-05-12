@@ -130,21 +130,28 @@ struct gadget_config_name {
 	struct list_head list;
 };
 
+#define MAX_USB_STRING_LEN	126
+#define MAX_USB_STRING_WITH_NULL_LEN	(MAX_USB_STRING_LEN+1)
+
 static int usb_string_copy(const char *s, char **s_copy)
 {
 	int ret;
 	char *str;
 	char *copy = *s_copy;
 	ret = strlen(s);
-	if (ret > 126)
+	if (ret > MAX_USB_STRING_LEN)
 		return -EOVERFLOW;
 
-	str = kstrdup(s, GFP_KERNEL);
-	if (!str)
-		return -ENOMEM;
+	if (copy) {
+		str = copy;
+	} else {
+		str = kmalloc(MAX_USB_STRING_WITH_NULL_LEN, GFP_KERNEL);
+		if (!str)
+			return -ENOMEM;
+	}
+	strncpy(str, s, MAX_USB_STRING_WITH_NULL_LEN);
 	if (str[ret - 1] == '\n')
 		str[ret - 1] = '\0';
-	kfree(copy);
 	*s_copy = str;
 	return 0;
 }
@@ -436,6 +443,11 @@ static int config_usb_cfg_link(
 	}
 
 	f = usb_get_function(fi);
+	if (f == NULL) {
+		/* Are we trying to symlink PTP without MTP function? */
+		ret = -EINVAL; /* Invalid Configuration */
+		goto out;
+	}
 	if (IS_ERR(f)) {
 		ret = PTR_ERR(f);
 		goto out;
@@ -1192,6 +1204,7 @@ static ssize_t interf_grp_compatible_id_store(struct usb_os_desc *desc,
 	if (desc->opts_mutex)
 		mutex_lock(desc->opts_mutex);
 	memcpy(desc->ext_compat_id, page, l);
+	desc->ext_compat_id[l] = '\0';
 
 	if (desc->opts_mutex)
 		mutex_unlock(desc->opts_mutex);
@@ -1222,6 +1235,7 @@ static ssize_t interf_grp_sub_compatible_id_store(struct usb_os_desc *desc,
 	if (desc->opts_mutex)
 		mutex_lock(desc->opts_mutex);
 	memcpy(desc->ext_compat_id + 8, page, l);
+	desc->ext_compat_id[l + 8] = '\0';
 
 	if (desc->opts_mutex)
 		mutex_unlock(desc->opts_mutex);
@@ -1697,6 +1711,10 @@ static struct config_group *gadgets_make(
 		const char *name)
 {
 	struct gadget_info *gi;
+	/* -Werror=unused-variable
+	struct device_attribute **attrs;
+	struct device_attribute *attr;
+	int err; */
 
 	gi = kzalloc(sizeof(*gi), GFP_KERNEL);
 	if (!gi)
@@ -1759,6 +1777,10 @@ err:
 
 static void gadgets_drop(struct config_group *group, struct config_item *item)
 {
+	/* -Werror=unused-variable
+	struct device_attribute **attrs;
+	struct device_attribute *attr; */
+
 	config_item_put(item);
 	android_device_destroy();
 }
@@ -1787,9 +1809,7 @@ void unregister_gadget_item(struct config_item *item)
 {
 	struct gadget_info *gi = to_gadget_info(item);
 
-	mutex_lock(&gi->lock);
 	unregister_gadget(gi);
-	mutex_unlock(&gi->lock);
 }
 EXPORT_SYMBOL_GPL(unregister_gadget_item);
 

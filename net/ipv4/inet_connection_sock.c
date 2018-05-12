@@ -411,7 +411,7 @@ struct dst_entry *inet_csk_route_req(struct sock *sk,
 			   flags,
 			   (opt && opt->opt.srr) ? opt->opt.faddr : ireq->ir_rmt_addr,
 			   ireq->ir_loc_addr, ireq->ir_rmt_port, inet_sk(sk)->inet_sport,
-			   sk->sk_uid);
+			   sock_i_uid(sk));
 	security_req_classify_flow(req, flowi4_to_flowi(fl4));
 	rt = ip_route_output_flow(net, fl4, sk);
 	if (IS_ERR(rt))
@@ -448,7 +448,7 @@ struct dst_entry *inet_csk_route_child_sock(struct sock *sk,
 			   sk->sk_protocol, inet_sk_flowi_flags(sk),
 			   (opt && opt->opt.srr) ? opt->opt.faddr : ireq->ir_rmt_addr,
 			   ireq->ir_loc_addr, ireq->ir_rmt_port, inet_sk(sk)->inet_sport,
-			   sk->sk_uid);
+			   sock_i_uid(sk));
 	security_req_classify_flow(req, flowi4_to_flowi(fl4));
 	rt = ip_route_output_flow(net, fl4, sk);
 	if (IS_ERR(rt))
@@ -679,8 +679,6 @@ struct sock *inet_csk_clone_lock(const struct sock *sk,
 		inet_sk(newsk)->inet_sport = htons(inet_rsk(req)->ir_num);
 		newsk->sk_write_space = sk_stream_write_space;
 
-		inet_sk(newsk)->mc_list = NULL;
-
 		newsk->sk_mark = inet_rsk(req)->ir_mark;
 
 		newicsk->icsk_retransmits = 0;
@@ -765,6 +763,10 @@ int inet_csk_listen_start(struct sock *sk, const int nr_table_entries)
 	if (!sk->sk_prot->get_port(sk, inet->inet_num)) {
 		inet->inet_sport = htons(inet->inet_num);
 
+#ifdef CONFIG_MTK_NET_LOGGING
+	pr_info("[mtk_net][socket] inet_csk_listen_start inet->inet_sport:%d,inet->inet_num:%d",
+		inet->inet_sport, inet->inet_num);
+#endif
 		sk_dst_reset(sk);
 		sk->sk_prot->hash(sk);
 

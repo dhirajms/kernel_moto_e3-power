@@ -26,7 +26,6 @@
 #include <linux/memblock.h>
 #include <linux/fs.h>
 #include <linux/io.h>
-#include <linux/slab.h>
 #include <linux/stop_machine.h>
 
 #include <asm/cputype.h>
@@ -37,17 +36,90 @@
 #include <asm/tlb.h>
 #include <asm/memblock.h>
 #include <asm/mmu_context.h>
+#include <mt-plat/mtk_memcfg.h>
 
 #include "mm.h"
-
-u64 idmap_t0sz = TCR_T0SZ(VA_BITS);
 
 /*
  * Empty_zero_page is a special page that is used for zero-initialized data
  * and COW.
  */
-unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)] __page_aligned_bss;
+struct page *empty_zero_page;
 EXPORT_SYMBOL(empty_zero_page);
+
+struct cachepolicy {
+	const char	policy[16];
+	u64		mair;
+	u64		tcr;
+};
+
+static struct cachepolicy cache_policies[] __initdata = {
+	{
+		.policy		= "uncached",
+		.mair		= 0x44,			/* inner, outer non-cacheable */
+		.tcr		= TCR_IRGN_NC | TCR_ORGN_NC,
+	}, {
+		.policy		= "writethrough",
+		.mair		= 0xaa,			/* inner, outer write-through, read-allocate */
+		.tcr		= TCR_IRGN_WT | TCR_ORGN_WT,
+	}, {
+		.policy		= "writeback",
+		.mair		= 0xee,			/* inner, outer write-back, read-allocate */
+		.tcr		= TCR_IRGN_WBnWA | TCR_ORGN_WBnWA,
+	}
+};
+
+/*
+ * These are useful for identifying cache coherency problems by allowing the
+ * cache or the cache and writebuffer to be turned off. It changes the Normal
+ * memory caching attributes in the MAIR_EL1 register.
+ */
+static int __init early_cachepolicy(char *p)
+{
+	int i;
+	u64 tmp;
+
+	for (i = 0; i < ARRAY_SIZE(cache_policies); i++) {
+		int len = strlen(cache_policies[i].policy);
+
+		if (memcmp(p, cache_policies[i].policy, len) == 0)
+			break;
+	}
+	if (i == ARRAY_SIZE(cache_policies)) {
+		pr_err("ERROR: unknown or unsupported cache policy: %s\n", p);
+		return 0;
+	}
+
+	flush_cache_all();
+
+	/*
+	 * Modify MT_NORMAL attributes in MAIR_EL1.
+	 */
+	asm volatile(
+	"	mrs	%0, mair_el1\n"
+	"	bfi	%0, %1, %2, #8\n"
+	"	msr	mair_el1, %0\n"
+	"	isb\n"
+	: "=&r" (tmp)
+	: "r" (cache_policies[i].mair), "i" (MT_NORMAL * 8));
+
+	/*
+	 * Modify TCR PTW cacheability attributes.
+	 */
+	asm volatile(
+	"	mrs	%0, tcr_el1\n"
+	"	bic	%0, %0, %2\n"
+	"	orr	%0, %0, %1\n"
+	"	msr	tcr_el1, %0\n"
+	"	isb\n"
+	: "=&r" (tmp)
+	: "r" (cache_policies[i].tcr), "r" (TCR_IRGN_MASK | TCR_ORGN_MASK));
+
+	flush_cache_all();
+
+	return 0;
+}
+early_param("cachepolicy", early_cachepolicy);
 
 pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 			      unsigned long size, pgprot_t vma_prot)
@@ -156,14 +228,8 @@ static void alloc_init_pmd(struct mm_struct *mm, pud_t *pud,
 			 * Check for previous table entries created during
 			 * boot (__create_page_tables) and flush them.
 			 */
-			if (!pmd_none(old_pmd)) {
+			if (!pmd_none(old_pmd))
 				flush_tlb_all();
-				if (pmd_table(old_pmd)) {
-					phys_addr_t table = __pa(pte_offset_map(&old_pmd, 0));
-					if (!WARN_ON_ONCE(slab_is_available()))
-						memblock_free(table, PAGE_SIZE);
-				}
-			}
 		} else {
 			alloc_init_pte(pmd, addr, next, __phys_to_pfn(phys),
 				       prot, alloc);
@@ -180,6 +246,14 @@ static inline bool use_1G_block(unsigned long addr, unsigned long next,
 
 	if (((addr | next | phys) & ~PUD_MASK) != 0)
 		return false;
+#ifdef CONFIG_MTK_SVP
+	/*
+	 * SSVP will unmapping memory region which shared with kernel
+	 * and SVP to prevent illegal fetch of EMI MPU Violation.
+	 * Return false to make all memory become pmd mapping.
+	 */
+	return false;
+#endif
 
 	return true;
 }
@@ -218,12 +292,9 @@ static void alloc_init_pud(struct mm_struct *mm, pgd_t *pgd,
 			 * Look up the old pmd table and free it.
 			 */
 			if (!pud_none(old_pud)) {
+				phys_addr_t table = __pa(pmd_offset(&old_pud, 0));
+				memblock_free(table, PAGE_SIZE);
 				flush_tlb_all();
-				if (pud_table(old_pud)) {
-					phys_addr_t table = __pa(pmd_offset(&old_pud, 0));
-					if (!WARN_ON_ONCE(slab_is_available()))
-						memblock_free(table, PAGE_SIZE);
-				}
 			}
 		} else {
 			alloc_init_pmd(mm, pud, addr, next, phys, prot, alloc);
@@ -281,7 +352,7 @@ void __init create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
 			       pgprot_t prot)
 {
 	__create_mapping(mm, pgd_offset(mm, virt), phys, virt, size, prot,
-				late_alloc);
+				early_alloc);
 }
 
 static void create_mapping_late(phys_addr_t phys, unsigned long virt,
@@ -329,6 +400,7 @@ static void __init __map_memblock(phys_addr_t start, phys_addr_t end)
 				end - kernel_x_end,
 				PAGE_KERNEL);
 	}
+
 }
 #else
 static void __init __map_memblock(phys_addr_t start, phys_addr_t end)
@@ -363,6 +435,13 @@ static void __init map_mem(void)
 	for_each_memblock(memory, reg) {
 		phys_addr_t start = reg->base;
 		phys_addr_t end = start + reg->size;
+		mtk_memcfg_write_memory_layout_info(MTK_MEMCFG_MEMBLOCK_PHY,
+				"kernel", start, reg->size);
+		MTK_MEMCFG_LOG_AND_PRINTK(
+			"[PHY layout]kernel   :   0x%08llx - 0x%08llx (0x%llx)\n",
+			(unsigned long long)start,
+			(unsigned long long)start + reg->size - 1,
+			(unsigned long long)reg->size);
 
 		if (start >= end)
 			break;
@@ -416,8 +495,9 @@ void __init fixup_executable(void)
 void mark_rodata_ro(void)
 {
 	create_mapping_late(__pa(_stext), (unsigned long)_stext,
-				(unsigned long)__init_begin - (unsigned long)_stext,
+				(unsigned long)_etext - (unsigned long)_stext,
 				PAGE_KERNEL_EXEC | PTE_RDONLY);
+
 }
 #endif
 
@@ -434,18 +514,40 @@ void fixup_init(void)
  */
 void __init paging_init(void)
 {
+	void *zero_page;
+
 	map_mem();
 	fixup_executable();
 
+	/*
+	 * Finally flush the caches and tlb to ensure that we're in a
+	 * consistent state.
+	 */
+	flush_cache_all();
+	flush_tlb_all();
+
+	/* allocate the zero page. */
+	zero_page = early_alloc(PAGE_SIZE);
+
 	bootmem_init();
+
+	empty_zero_page = virt_to_page(zero_page);
 
 	/*
 	 * TTBR0 is only used for the identity mapping at this stage. Make it
 	 * point to zero page to avoid speculatively fetching new entries.
 	 */
 	cpu_set_reserved_ttbr0();
-	local_flush_tlb_all();
-	cpu_set_default_tcr_t0sz();
+	flush_tlb_all();
+}
+
+/*
+ * Enable the identity mapping to allow the MMU disabling.
+ */
+void setup_mm_for_reboot(void)
+{
+	cpu_switch_mm(idmap_pg_dir, &init_mm);
+	flush_tlb_all();
 }
 
 /*
@@ -533,10 +635,10 @@ void vmemmap_free(unsigned long start, unsigned long end)
 #endif	/* CONFIG_SPARSEMEM_VMEMMAP */
 
 static pte_t bm_pte[PTRS_PER_PTE] __page_aligned_bss;
-#if CONFIG_PGTABLE_LEVELS > 2
+#if CONFIG_ARM64_PGTABLE_LEVELS > 2
 static pmd_t bm_pmd[PTRS_PER_PMD] __page_aligned_bss;
 #endif
-#if CONFIG_PGTABLE_LEVELS > 3
+#if CONFIG_ARM64_PGTABLE_LEVELS > 3
 static pud_t bm_pud[PTRS_PER_PUD] __page_aligned_bss;
 #endif
 

@@ -16,7 +16,6 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
-#include <linux/of.h>
 #include <linux/pm_runtime.h>
 
 #include <linux/mmc/card.h>
@@ -278,6 +277,9 @@ struct mmc_card *mmc_alloc_card(struct mmc_host *host, struct device_type *type)
 	card->dev.bus = &mmc_bus_type;
 	card->dev.release = mmc_release_card;
 	card->dev.type = type;
+#ifdef MTK_BKOPS_IDLE_MAYA
+	spin_lock_init(&card->bkops_info.bkops_stats.lock);
+#endif
 
 	return card;
 }
@@ -353,8 +355,6 @@ int mmc_add_card(struct mmc_card *card)
 #endif
 	mmc_init_context_info(card->host);
 
-	card->dev.of_node = mmc_of_find_child_device(card->host, 0);
-
 	ret = device_add(&card->dev);
 	if (ret)
 		return ret;
@@ -383,7 +383,6 @@ void mmc_remove_card(struct mmc_card *card)
 				mmc_hostname(card->host), card->rca);
 		}
 		device_del(&card->dev);
-		of_node_put(card->dev.of_node);
 	}
 
 	put_device(&card->dev);

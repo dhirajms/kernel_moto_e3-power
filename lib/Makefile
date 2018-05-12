@@ -6,18 +6,9 @@ ifdef CONFIG_FUNCTION_TRACER
 ORIG_CFLAGS := $(KBUILD_CFLAGS)
 KBUILD_CFLAGS = $(subst -pg,,$(ORIG_CFLAGS))
 endif
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include
 
-# These files are disabled because they produce lots of non-interesting and/or
-# flaky coverage that is not a function of syscall inputs. For example,
-# rbtree can be global and individual rotations don't correlate with inputs.
-KCOV_INSTRUMENT_string.o := n
-KCOV_INSTRUMENT_rbtree.o := n
-KCOV_INSTRUMENT_list_debug.o := n
-KCOV_INSTRUMENT_debugobjects.o := n
-KCOV_INSTRUMENT_dynamic_debug.o := n
-# Kernel does not boot if we instrument this file as it uses custom calling
-# convention (see CONFIG_ARCH_HWEIGHT_CFLAGS).
-KCOV_INSTRUMENT_hweight.o := n
+subdir-ccflags-y += -Werror
 
 lib-y := ctype.o string.o vsprintf.o cmdline.o \
 	 rbtree.o radix-tree.o dump_stack.o timerqueue.o\
@@ -208,3 +199,5 @@ quiet_cmd_build_OID_registry = GEN     $@
 clean-files	+= oid_registry_data.c
 
 obj-$(CONFIG_UCS2_STRING) += ucs2_string.o
+
+obj-$(CONFIG_LZ4K) += lz4k/

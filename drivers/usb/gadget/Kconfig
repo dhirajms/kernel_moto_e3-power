@@ -401,7 +401,6 @@ config USB_CONFIGFS_F_ACC
 config USB_CONFIGFS_F_AUDIO_SRC
 	boolean "Audio Source gadget"
 	depends on USB_CONFIGFS && USB_CONFIGFS_F_ACC
-	depends on SND_PCM
 	select USB_F_AUDIO_SRC
 	help
 	  USB gadget Audio Source support
@@ -432,6 +431,10 @@ config USB_G_ANDROID
 	select USB_F_ACM
 	select USB_LIBCOMPOSITE
 	select USB_U_SERIAL
+	select USB_F_FS
+	select USB_F_MASS_STORAGE
+	select USB_F_AUDIO_SRC
+	select USB_F_SERIAL
 	help
 	  The Android Composite Gadget supports multiple USB
 	  functions: adb, acm, mass storage, mtp, accessory
